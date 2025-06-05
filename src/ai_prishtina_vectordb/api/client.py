@@ -3,7 +3,7 @@ Base API client for AIPrishtina VectorDB.
 """
 
 from typing import Dict, Any, Optional, Union
-import requests
+import aiohttp
 from .exceptions import (
     APIError,
     APIConfigurationError,
@@ -46,10 +46,19 @@ class BaseAPIClient:
         if api_key:
             self.headers['Authorization'] = f'Bearer {api_key}'
         
-        self.session = requests.Session()
-        self.session.headers.update(self.headers)
+        self.session = None
     
-    def _make_request(
+    async def __aenter__(self):
+        """Async context manager entry."""
+        self.session = aiohttp.ClientSession(headers=self.headers)
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager exit."""
+        if self.session:
+            await self.session.close()
+    
+    async def _make_request(
         self,
         method: str,
         endpoint: str,
@@ -76,8 +85,11 @@ class BaseAPIClient:
         """
         url = f"{self.base_url}/{endpoint.lstrip('/')}"
         
+        if not self.session:
+            self.session = aiohttp.ClientSession(headers=self.headers)
+        
         try:
-            response = self.session.request(
+            async with self.session.request(
                 method=method,
                 url=url,
                 params=params,
@@ -85,34 +97,33 @@ class BaseAPIClient:
                 json=json,
                 headers=headers,
                 timeout=self.timeout
-            )
-            
-            # Handle different status codes
-            if response.status_code == 200:
-                return response.json()
-            elif response.status_code == 400:
-                raise APIValidationError(f"Validation error: {response.text}")
-            elif response.status_code == 401:
-                raise APIAuthenticationError(f"Authentication error: {response.text}")
-            elif response.status_code == 403:
-                raise APIAuthenticationError(f"Permission denied: {response.text}")
-            elif response.status_code == 404:
-                raise APINotFoundError(f"Resource not found: {response.text}")
-            elif response.status_code == 429:
-                raise APIRateLimitError(f"Rate limit exceeded: {response.text}")
-            elif response.status_code >= 500:
-                raise APIServerError(f"Server error: {response.text}")
-            else:
-                raise APIError(f"Unexpected error: {response.text}")
+            ) as response:
+                # Handle different status codes
+                if response.status == 200:
+                    return await response.json()
+                elif response.status == 400:
+                    raise APIValidationError(f"Validation error: {await response.text()}")
+                elif response.status == 401:
+                    raise APIAuthenticationError(f"Authentication error: {await response.text()}")
+                elif response.status == 403:
+                    raise APIAuthenticationError(f"Permission denied: {await response.text()}")
+                elif response.status == 404:
+                    raise APINotFoundError(f"Resource not found: {await response.text()}")
+                elif response.status == 429:
+                    raise APIRateLimitError(f"Rate limit exceeded: {await response.text()}")
+                elif response.status >= 500:
+                    raise APIServerError(f"Server error: {await response.text()}")
+                else:
+                    raise APIError(f"Unexpected error: {await response.text()}")
                 
-        except requests.exceptions.Timeout:
+        except aiohttp.ClientTimeout:
             raise APITimeoutError("Request timed out")
-        except requests.exceptions.ConnectionError:
+        except aiohttp.ClientConnectionError:
             raise APIConnectionError("Failed to connect to the API")
-        except requests.exceptions.RequestException as e:
+        except aiohttp.ClientError as e:
             raise APIClientError(f"Request failed: {str(e)}")
     
-    def get(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    async def get(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Make a GET request.
         
         Args:
@@ -122,9 +133,9 @@ class BaseAPIClient:
         Returns:
             Response data as dictionary
         """
-        return self._make_request('GET', endpoint, params=params)
+        return await self._make_request('GET', endpoint, params=params)
     
-    def post(
+    async def post(
         self,
         endpoint: str,
         data: Optional[Dict[str, Any]] = None,
@@ -140,9 +151,9 @@ class BaseAPIClient:
         Returns:
             Response data as dictionary
         """
-        return self._make_request('POST', endpoint, data=data, json=json)
+        return await self._make_request('POST', endpoint, data=data, json=json)
     
-    def put(
+    async def put(
         self,
         endpoint: str,
         data: Optional[Dict[str, Any]] = None,
@@ -158,9 +169,9 @@ class BaseAPIClient:
         Returns:
             Response data as dictionary
         """
-        return self._make_request('PUT', endpoint, data=data, json=json)
+        return await self._make_request('PUT', endpoint, data=data, json=json)
     
-    def delete(self, endpoint: str) -> Dict[str, Any]:
+    async def delete(self, endpoint: str) -> Dict[str, Any]:
         """Make a DELETE request.
         
         Args:
@@ -169,8 +180,10 @@ class BaseAPIClient:
         Returns:
             Response data as dictionary
         """
-        return self._make_request('DELETE', endpoint)
+        return await self._make_request('DELETE', endpoint)
     
-    def close(self):
+    async def close(self):
         """Close the session."""
-        self.session.close() 
+        if self.session:
+            await self.session.close()
+            self.session = None 

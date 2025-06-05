@@ -3,6 +3,7 @@ Unit tests for streaming functionality in AIPrishtina VectorDB.
 """
 
 import unittest
+import pytest
 import tempfile
 import os
 from pathlib import Path
@@ -17,14 +18,16 @@ class TestStreaming(unittest.TestCase):
     def setUp(self):
         """Set up test fixtures."""
         self.logger = AIPrishtinaLogger(level="DEBUG")
-        self.temp_dir = tempfile.mkdtemp()
+        self.temp_dir = Path("temp_test_dir")
+        self.temp_dir.mkdir(exist_ok=True)
         
     def tearDown(self):
         """Clean up test fixtures."""
         import shutil
         shutil.rmtree(self.temp_dir)
         
-    def test_stream_from_file(self):
+    @pytest.mark.asyncio
+    async def test_stream_from_file(self):
         """Test streaming from a file."""
         # Create test file
         file_path = Path(self.temp_dir) / "test.txt"
@@ -32,13 +35,16 @@ class TestStreaming(unittest.TestCase):
             f.write("Line 1\nLine 2\nLine 3")
             
         source = DataSource(source_type="text")
-        batches = list(source.stream_data(file_path, batch_size=2))
+        batches = []
+        async for batch in source.stream_data(file_path, batch_size=2):
+            batches.append(batch)
         
         self.assertEqual(len(batches), 2)
-        self.assertEqual(len(batches[0]["documents"]), 2)
-        self.assertEqual(len(batches[1]["documents"]), 1)
+        self.assertEqual(len(batches[0]), 2)
+        self.assertEqual(len(batches[1]), 1)
         
-    def test_stream_from_dataframe(self):
+    @pytest.mark.asyncio
+    async def test_stream_from_dataframe(self):
         """Test streaming from a DataFrame."""
         df = pd.DataFrame({
             "text": ["A", "B", "C", "D", "E"],
@@ -46,14 +52,17 @@ class TestStreaming(unittest.TestCase):
         })
         
         source = DataSource(source_type="text")
-        batches = list(source.stream_data(df, text_column="text", batch_size=2))
+        batches = []
+        async for batch in source.stream_data(df, text_column="text", batch_size=2):
+            batches.append(batch)
         
         self.assertEqual(len(batches), 3)
-        self.assertEqual(len(batches[0]["documents"]), 2)
-        self.assertEqual(len(batches[1]["documents"]), 2)
-        self.assertEqual(len(batches[2]["documents"]), 1)
+        self.assertEqual(len(batches[0]), 2)
+        self.assertEqual(len(batches[1]), 2)
+        self.assertEqual(len(batches[2]), 1)
         
-    def test_stream_from_list(self):
+    @pytest.mark.asyncio
+    async def test_stream_from_list(self):
         """Test streaming from a list of dictionaries."""
         data = [
             {"text": "A", "meta": 1},
@@ -62,22 +71,27 @@ class TestStreaming(unittest.TestCase):
         ]
         
         source = DataSource(source_type="text")
-        batches = list(source.stream_data(data, text_column="text", batch_size=2))
+        batches = []
+        async for batch in source.stream_data(data, text_column="text", batch_size=2):
+            batches.append(batch)
         
         self.assertEqual(len(batches), 2)
-        self.assertEqual(len(batches[0]["documents"]), 2)
-        self.assertEqual(len(batches[1]["documents"]), 1)
+        self.assertEqual(len(batches[0]), 2)
+        self.assertEqual(len(batches[1]), 1)
         
-    def test_stream_from_binary(self):
+    @pytest.mark.asyncio
+    async def test_stream_from_binary(self):
         """Test streaming from binary data."""
         data = np.array([[1, 2], [3, 4], [5, 6]])
         
         source = DataSource(source_type="binary")
-        batches = list(source.stream_data(data, batch_size=2))
+        batches = []
+        async for batch in source.stream_data(data, batch_size=2):
+            batches.append(batch)
         
         self.assertEqual(len(batches), 2)
-        self.assertEqual(len(batches[0]["documents"]), 2)
-        self.assertEqual(len(batches[1]["documents"]), 1)
+        self.assertEqual(len(batches[0]), 2)
+        self.assertEqual(len(batches[1]), 1)
 
 if __name__ == '__main__':
     unittest.main() 

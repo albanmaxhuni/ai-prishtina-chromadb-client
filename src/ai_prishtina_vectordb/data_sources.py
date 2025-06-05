@@ -8,22 +8,25 @@ import tempfile
 import uuid
 from io import StringIO
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union, Iterator, Generator
+from typing import Any, Dict, List, Optional, Union, AsyncIterator, AsyncGenerator
 import itertools
 import os
 import hashlib
+import aiohttp
+import aioboto3
+import aiofiles
+from azure.storage.blob.aio import BlobServiceClient
+from google.cloud import storage
+from google.cloud.storage.blob import Blob
+import asyncio
 
 import PyPDF2
-import boto3
 import docx
 import numpy as np
 import pandas as pd
-import requests
 import torch
-from azure.storage.blob import BlobServiceClient
 from botocore.exceptions import ClientError
 from chromadb.utils import embedding_functions
-from google.cloud import storage
 from sentence_transformers import SentenceTransformer
 from PIL import Image
 import soundfile as sf
@@ -34,7 +37,6 @@ from minio import Minio
 from minio.error import S3Error
 from .exceptions import DataSourceError
 from .logger import AIPrishtinaLogger
-
 
 class DataSource:
     """
@@ -82,17 +84,26 @@ class DataSource:
         self.gcs_client = None
         self.azure_client = None
         self.minio_client = None
+        self._session = None
 
-    def _init_cloud_clients(self, **kwargs):
+    async def __aenter__(self):
+        self._session = aiohttp.ClientSession()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self._session:
+            await self._session.close()
+
+    async def _init_cloud_clients(self, **kwargs):
         """Initialize cloud storage clients."""
         try:
             if 'aws_access_key_id' in kwargs and 'aws_secret_access_key' in kwargs:
-                self.s3_client = boto3.client(
-                    's3',
+                session = aioboto3.Session(
                     aws_access_key_id=kwargs['aws_access_key_id'],
                     aws_secret_access_key=kwargs['aws_secret_access_key'],
                     region_name=kwargs.get('aws_region', 'us-east-1')
                 )
+                self.s3_client = await session.client('s3')
             
             if 'gcp_credentials' in kwargs:
                 self.gcs_client = storage.Client.from_service_account_json(kwargs['gcp_credentials'])
@@ -112,7 +123,7 @@ class DataSource:
         except Exception as e:
             raise DataSourceError(f"Failed to initialize cloud storage clients: {str(e)}")
 
-    def load_data(
+    async def load_data(
         self,
         source: Union[str, Path, pd.DataFrame, List[Dict[str, Any]], bytes, np.ndarray, torch.Tensor],
         text_column: Optional[str] = None,
@@ -134,10 +145,10 @@ class DataSource:
         try:
             if isinstance(source, (str, Path)):
                 if self._is_url(str(source)):
-                    return self._load_from_url(str(source), text_column, metadata_columns, **kwargs)
+                    return await self._load_from_url(str(source), text_column, metadata_columns, **kwargs)
                 elif self._is_cloud_storage_path(str(source)):
-                    return self._load_from_cloud_storage(str(source), text_column, metadata_columns, **kwargs)
-                return self._load_from_file(source, text_column, metadata_columns, **kwargs)
+                    return await self._load_from_cloud_storage(str(source), text_column, metadata_columns, **kwargs)
+                return await self._load_from_file(source, text_column, metadata_columns, **kwargs)
             elif isinstance(source, pd.DataFrame):
                 return self._load_from_dataframe(source, text_column, metadata_columns, **kwargs)
             elif isinstance(source, list):
@@ -158,7 +169,7 @@ class DataSource:
             source.startswith('minio://')
         )
 
-    def _load_from_cloud_storage(
+    async def _load_from_cloud_storage(
         self,
         path: str,
         text_column: Optional[str],
@@ -167,17 +178,17 @@ class DataSource:
     ) -> Dict[str, Any]:
         """Load data from cloud storage."""
         if path.startswith('s3://'):
-            return self._load_from_s3(path, text_column, metadata_columns, **kwargs)
+            return await self._load_from_s3(path, text_column, metadata_columns, **kwargs)
         elif path.startswith('gs://'):
-            return self._load_from_gcs(path, text_column, metadata_columns, **kwargs)
+            return await self._load_from_gcs(path, text_column, metadata_columns, **kwargs)
         elif path.startswith('azure://'):
-            return self._load_from_azure(path, text_column, metadata_columns, **kwargs)
+            return await self._load_from_azure(path, text_column, metadata_columns, **kwargs)
         elif path.startswith('minio://'):
-            return self._load_from_minio(path, text_column, metadata_columns, **kwargs)
+            return await self._load_from_minio(path, text_column, metadata_columns, **kwargs)
         else:
             raise ValueError(f"Unsupported cloud storage path: {path}")
 
-    def _load_from_s3(
+    async def _load_from_s3(
         self,
         path: str,
         text_column: Optional[str],
@@ -188,8 +199,8 @@ class DataSource:
         bucket_name = path.split('/')[2]
         key = '/'.join(path.split('/')[3:])
         try:
-            response = self.s3_client.get_object(Bucket=bucket_name, Key=key)
-            content = response['Body'].read()
+            response = await self.s3_client.get_object(Bucket=bucket_name, Key=key)
+            content = await response['Body'].read()
             # Always decode .txt as text
             if Path(key).suffix == '.txt':
                 content = content.decode('utf-8')
@@ -198,14 +209,11 @@ class DataSource:
                 content = content.decode('utf-8')
                 return self._load_text_content(content, metadata_columns)
             except UnicodeDecodeError:
-                with tempfile.NamedTemporaryFile(suffix=Path(key).suffix, delete=False) as temp_file:
-                    temp_file.write(content)
-                    temp_file.flush()
-                    return self._load_from_file(temp_file.name, text_column, metadata_columns, **kwargs)
-        except ClientError as e:
-            raise ValueError(f"Error loading from S3: {str(e)}")
+                return self._load_binary_content(content, metadata_columns)
+        except Exception as e:
+            raise DataSourceError(f"Failed to load from S3: {str(e)}")
 
-    def _load_from_gcs(
+    async def _load_from_gcs(
         self,
         path: str,
         text_column: Optional[str],
@@ -221,12 +229,12 @@ class DataSource:
             blob = bucket.blob(blob_name)
             
             with tempfile.NamedTemporaryFile(suffix=Path(blob_name).suffix, delete=False) as temp_file:
-                blob.download_to_filename(temp_file.name)
-                return self._load_from_file(temp_file.name, text_column, metadata_columns, **kwargs)
+                await blob.download_to_file(temp_file)
+                return await self._load_from_file(temp_file.name, text_column, metadata_columns, **kwargs)
         except Exception as e:
             raise ValueError(f"Error loading from GCS: {str(e)}")
 
-    def _load_from_azure(
+    async def _load_from_azure(
         self,
         path: str,
         text_column: Optional[str],
@@ -242,14 +250,14 @@ class DataSource:
             blob_client = container_client.get_blob_client(blob_name)
             
             with tempfile.NamedTemporaryFile(suffix=Path(blob_name).suffix, delete=False) as temp_file:
-                blob_data = blob_client.download_blob()
-                temp_file.write(blob_data.readall())
+                blob_data = await blob_client.download_blob()
+                temp_file.write(await blob_data.readall())
                 temp_file.flush()
-                return self._load_from_file(temp_file.name, text_column, metadata_columns, **kwargs)
+                return await self._load_from_file(temp_file.name, text_column, metadata_columns, **kwargs)
         except Exception as e:
             raise ValueError(f"Error loading from Azure: {str(e)}")
 
-    def _load_from_minio(
+    async def _load_from_minio(
         self,
         path: str,
         text_column: Optional[str],
@@ -262,87 +270,85 @@ class DataSource:
         
         try:
             # Get object data
-            data = self.minio_client.get_object(bucket_name, object_name)
+            data = await self.minio_client.get_object(bucket_name, object_name)
             
             # Handle different file types
             if object_name.endswith('.txt'):
-                content = data.read().decode('utf-8')
+                content = await data.read()
+                content = content.decode('utf-8')
                 return self._load_text_content(content, metadata_columns)
             elif object_name.endswith('.json'):
-                content = json.loads(data.read().decode('utf-8'))
+                content = await data.read()
+                content = json.loads(content.decode('utf-8'))
                 return self._load_json_content(content, text_column, metadata_columns)
             elif object_name.endswith('.csv'):
-                content = data.read().decode('utf-8')
+                content = await data.read()
+                content = content.decode('utf-8')
                 return self._load_csv_content(content, text_column, metadata_columns)
             else:
                 # For binary files, save to temp file and process
                 with tempfile.NamedTemporaryFile(suffix=Path(object_name).suffix, delete=False) as temp_file:
-                    temp_file.write(data.read())
+                    temp_file.write(await data.read())
                     temp_file.flush()
-                    return self._load_from_file(temp_file.name, text_column, metadata_columns, **kwargs)
+                    return await self._load_from_file(temp_file.name, text_column, metadata_columns, **kwargs)
                     
         except S3Error as e:
             raise DataSourceError(f"Error loading from MinIO: {str(e)}")
 
-    def _load_from_file(
+    async def _load_from_file(
         self,
         file_path: Union[str, Path],
         text_column: Optional[str],
         metadata_columns: Optional[List[str]],
         **kwargs
     ) -> Dict[str, Any]:
-        """Load data from a file."""
+        """Load data from a local file."""
         file_path = Path(file_path)
-        
-        # Route based on source type first
-        if self.source_type == 'image':
-            return DataSource._load_image_file(file_path, metadata_columns)
-        elif self.source_type == 'audio':
-            return DataSource._load_audio_file(file_path, metadata_columns)
-        elif self.source_type == 'video':
-            return DataSource._load_video_file(file_path, metadata_columns)
-        elif self.source_type == 'excel':
-            df = pd.read_excel(file_path, **kwargs)
-            return self._load_from_dataframe(df, text_column, metadata_columns, **kwargs)
-        elif self.source_type == 'word':
-            return self._load_from_word(file_path, metadata_columns)
-        elif self.source_type == 'pdf':
-            return self._load_from_pdf(file_path, metadata_columns)
-            
-        # Then route based on file extension
-        if file_path.suffix == '.json':
-            with open(file_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            return self._load_from_list(data, text_column, metadata_columns, **kwargs)
-            
-        elif file_path.suffix == '.csv':
-            df = pd.read_csv(file_path, **kwargs)
-            return self._load_from_dataframe(df, text_column, metadata_columns, **kwargs)
-            
-        elif file_path.suffix in ['.xls', '.xlsx']:
-            df = pd.read_excel(file_path, **kwargs)
-            return self._load_from_dataframe(df, text_column, metadata_columns, **kwargs)
-            
-        elif file_path.suffix in ['.doc', '.docx']:
-            return self._load_from_word(file_path, metadata_columns)
-            
-        elif file_path.suffix == '.pdf':
-            return self._load_from_pdf(file_path, metadata_columns)
-            
-        elif file_path.suffix in ['.txt', '.md']:
-            return DataSource._load_text_file(file_path, metadata_columns)
-            
-        elif file_path.suffix in ['.jpg', '.jpeg', '.png']:
-            return DataSource._load_image_file(file_path, metadata_columns)
-            
-        elif file_path.suffix in ['.wav', '.mp3']:
-            return DataSource._load_audio_file(file_path, metadata_columns)
-            
-        elif file_path.suffix in ['.mp4', '.avi']:
-            return DataSource._load_video_file(file_path, metadata_columns)
-            
-        else:
-            raise ValueError(f"Unsupported file type: {file_path.suffix}")
+        if not file_path.exists():
+            raise DataSourceError(f"File not found: {file_path}")
+
+        try:
+            if file_path.suffix.lower() in ['.doc', '.docx']:
+                return await self._load_from_word(file_path, metadata_columns)
+            elif file_path.suffix.lower() == '.pdf':
+                return await self._load_from_pdf(file_path, metadata_columns)
+            elif file_path.suffix.lower() in ['.txt', '.md']:
+                async with aiofiles.open(file_path, 'r', encoding='utf-8') as f:
+                    content = await f.read()
+                return self._load_text_content(content, metadata_columns)
+            elif file_path.suffix.lower() in ['.jpg', '.jpeg', '.png']:
+                return await self._load_image_file(file_path, metadata_columns)
+            elif file_path.suffix.lower() in ['.wav', '.mp3']:
+                return await self._load_audio_file(file_path, metadata_columns)
+            elif file_path.suffix.lower() in ['.mp4', '.avi']:
+                return await self._load_video_file(file_path, metadata_columns)
+            else:
+                raise ValueError(f"Unsupported file type: {file_path.suffix}")
+        except Exception as e:
+            raise DataSourceError(f"Failed to load file: {str(e)}")
+
+    async def _load_from_url(
+        self,
+        url: str,
+        text_column: Optional[str] = None,
+        metadata_columns: Optional[List[str]] = None,
+        **kwargs
+    ) -> Dict[str, Any]:
+        """Load data from a URL."""
+        try:
+            async with self._session.get(url) as response:
+                if response.status != 200:
+                    raise DataSourceError(f"Failed to fetch URL: {response.status}")
+                
+                content_type = response.headers.get('content-type', '')
+                if 'text' in content_type:
+                    content = await response.text()
+                    return self._load_text_content(content, metadata_columns)
+                else:
+                    content = await response.read()
+                    return self._load_binary_content(content, metadata_columns)
+        except Exception as e:
+            raise DataSourceError(f"Failed to load from URL: {str(e)}")
 
     def _load_from_word(
         self,
@@ -380,22 +386,20 @@ class DataSource:
             raise DataSourceError(f"Failed to read PDF file: {str(e)}")
 
     @staticmethod
-    def _load_text_file(
-        file_path: Path,
+    def _load_text_content(
+        content: str,
         metadata_columns: Optional[List[str]]
     ) -> Dict[str, Any]:
-        """Load data from a text file."""
-        with open(file_path, 'r', encoding='utf-8') as f:
-            texts = f.readlines()
-            
-        metadata = {'source': str(file_path)}
+        """Load text content into documents format."""
+        lines = content.splitlines()
+        metadata = {'type': 'text'}
         if metadata_columns:
             metadata.update({col: None for col in metadata_columns})
             
         return {
-            'documents': texts,
-            'metadatas': [metadata] * len(texts),
-            'ids': [f"{file_path.stem}_{i}" for i in range(len(texts))]
+            'documents': lines,
+            'metadatas': [metadata] * len(lines),
+            'ids': [str(uuid.uuid4()) for _ in range(len(lines))]
         }
 
     @staticmethod
@@ -650,53 +654,6 @@ class DataSource:
         """Check if the source is a URL."""
         return source.startswith(("http://", "https://", "s3://", "gs://", "azure://", "minio://"))
 
-    def _load_from_url(
-        self,
-        url: str,
-        text_column: Optional[str] = None,
-        metadata_columns: Optional[List[str]] = None,
-        **kwargs
-    ) -> Dict[str, Any]:
-        """Load data from a URL or cloud storage."""
-        if url.startswith("s3://"):
-            return self._load_from_s3(url, text_column, metadata_columns, **kwargs)
-        elif url.startswith("gs://"):
-            return self._load_from_gcs(url, text_column, metadata_columns, **kwargs)
-        elif url.startswith("azure://"):
-            return self._load_from_azure(url, text_column, metadata_columns, **kwargs)
-        elif url.startswith("minio://"):
-            return self._load_from_minio(url, text_column, metadata_columns, **kwargs)
-        else:
-            response = requests.get(url)
-            response.raise_for_status()
-            # Try to determine content type
-            content_type = response.headers.get("content-type", "").lower()
-            if "text" in content_type:
-                return self._load_text_content(response.text, metadata_columns)
-            elif "json" in content_type:
-                return self._load_json_content(response.json(), text_column, metadata_columns)
-            elif "csv" in content_type:
-                return self._load_csv_content(response.text, text_column, metadata_columns)
-            else:
-                return self._load_binary_content(response.content, metadata_columns)
-
-    @staticmethod
-    def _load_text_content(
-        self,
-        content: str,
-        metadata_columns: Optional[List[str]]
-    ) -> Dict[str, Any]:
-        """Load data from text content."""
-        metadata = {'type': 'text'}
-        if metadata_columns:
-            metadata.update({col: None for col in metadata_columns})
-            
-        return {
-            'documents': [content],
-            'metadatas': [metadata],
-            'ids': [f"text_{uuid.uuid4()}"]
-        }
-
     @staticmethod
     def _load_json_content(
         self,
@@ -753,53 +710,60 @@ class DataSource:
             "ids": [str(uuid.uuid4())]
         }
 
-    def stream_data(
+    async def stream_data(
         self,
         source: Union[str, Path, pd.DataFrame, List[Dict[str, Any]], bytes, np.ndarray, torch.Tensor],
         batch_size: int = 100,
         text_column: Optional[str] = None,
         metadata_columns: Optional[List[str]] = None,
         **kwargs
-    ) -> Iterator[Dict[str, Any]]:
+    ) -> AsyncIterator[Dict[str, Any]]:
         """
         Stream data from various sources in batches.
         
         Args:
-            source: Data source (file path, DataFrame, list of dicts, bytes, numpy array, torch tensor)
+            source: Data source
             batch_size: Number of items per batch
-            text_column: Column name containing text to vectorize
+            text_column: Column name containing text
             metadata_columns: Columns to include as metadata
-            **kwargs: Additional streaming parameters
+            **kwargs: Additional parameters
             
-        Returns:
-            Iterator yielding batches of data
+        Yields:
+            Dict containing batch of documents, metadatas, and ids
         """
         try:
             if isinstance(source, (str, Path)):
                 if self._is_url(str(source)):
-                    return self._stream_from_url(str(source), batch_size, text_column, metadata_columns, **kwargs)
+                    async for batch in self._stream_from_url(str(source), batch_size, text_column, metadata_columns, **kwargs):
+                        yield batch
                 elif self._is_cloud_storage_path(str(source)):
-                    return self._stream_from_cloud_storage(str(source), batch_size, text_column, metadata_columns, **kwargs)
-                return self._stream_file(source, batch_size)
-            elif isinstance(source, pd.DataFrame):
-                return self._stream_dataframe(source, text_column, metadata_columns, batch_size)
+                    async for batch in self._stream_from_cloud_storage(str(source), batch_size, text_column, metadata_columns, **kwargs):
+                        yield batch
+                else:
+                    async for batch in self._stream_file(source, batch_size):
+                        yield batch
             elif isinstance(source, list):
-                return self._stream_list(source, text_column, metadata_columns, batch_size)
+                async for batch in self._stream_list(source, text_column, metadata_columns, batch_size):
+                    yield batch
+            elif isinstance(source, pd.DataFrame):
+                async for batch in self._stream_dataframe(source, text_column, metadata_columns, batch_size):
+                    yield batch
             elif isinstance(source, (bytes, np.ndarray, torch.Tensor)):
-                return self._stream_binary(source, batch_size)
+                async for batch in self._stream_binary(source, batch_size):
+                    yield batch
             else:
                 raise ValueError(f"Unsupported source type: {type(source)}")
         except Exception as e:
             raise DataSourceError(f"Failed to stream data: {str(e)}")
 
-    def _stream_from_cloud_storage(
+    async def _stream_from_cloud_storage(
         self,
         path: str,
         batch_size: int = 100,
         text_column: Optional[str] = None,
         metadata_columns: Optional[List[str]] = None,
         **kwargs
-    ) -> Iterator[Dict[str, Any]]:
+    ) -> AsyncIterator[Dict[str, Any]]:
         """Stream data from cloud storage."""
         if not path.startswith(('s3://', 'gs://', 'azure://', 'minio://')):
             raise ValueError(f"Invalid cloud storage path format: {path}")
@@ -815,14 +779,14 @@ class DataSource:
         else:
             raise ValueError(f"Invalid cloud storage path format: {path}")
 
-    def _stream_from_s3(
+    async def _stream_from_s3(
         self,
         path: str,
         batch_size: int = 100,
         text_column: Optional[str] = None,
         metadata_columns: Optional[List[str]] = None,
         **kwargs
-    ) -> Iterator[Dict[str, Any]]:
+    ) -> AsyncIterator[Dict[str, Any]]:
         """Stream data from Amazon S3."""
         try:
             bucket_name = path.split('/')[2]
@@ -830,7 +794,7 @@ class DataSource:
             
             # Initialize S3 client if not already initialized
             if self.s3_client is None:
-                self._init_cloud_clients(**kwargs)
+                await self._init_cloud_clients(**kwargs)
                 if self.s3_client is None:
                     raise DataSourceError("Failed to initialize S3 client")
             
@@ -841,8 +805,8 @@ class DataSource:
                     
                 for obj in page['Contents']:
                     key = obj['Key']
-                    response = self.s3_client.get_object(Bucket=bucket_name, Key=key)
-                    content = response['Body'].read()
+                    response = await self.s3_client.get_object(Bucket=bucket_name, Key=key)
+                    content = await response['Body'].read()
                     
                     # Process content based on file type
                     if key.endswith('.txt'):
@@ -866,14 +830,14 @@ class DataSource:
         except Exception as e:
             raise DataSourceError(f"Failed to stream from S3: {str(e)}")
 
-    def _stream_from_minio(
+    async def _stream_from_minio(
         self,
         path: str,
         batch_size: int = 100,
         text_column: Optional[str] = None,
         metadata_columns: Optional[List[str]] = None,
         **kwargs
-    ) -> Iterator[Dict[str, Any]]:
+    ) -> AsyncIterator[Dict[str, Any]]:
         """Stream data from MinIO."""
         try:
             bucket_name = path.split('/')[2]
@@ -890,7 +854,7 @@ class DataSource:
                     raise ValueError("MinIO access key is required")
                 if not secret_key:
                     raise ValueError("MinIO secret key is required")
-                self._init_cloud_clients(**kwargs)
+                await self._init_cloud_clients(**kwargs)
                 minio_client = self.minio_client
                 if minio_client is None:
                     raise DataSourceError("Failed to initialize MinIO client")
@@ -899,8 +863,8 @@ class DataSource:
             batch_docs, batch_metas = [], []
             for obj in objects:
                 try:
-                    data = minio_client.get_object(bucket_name, obj.object_name)
-                    content = data.read()
+                    data = await minio_client.get_object(bucket_name, obj.object_name)
+                    content = await data.read()
                     if obj.object_name.endswith('.txt'):
                         content = content.decode('utf-8')
                         batch_docs.append(content)
@@ -926,14 +890,14 @@ class DataSource:
         except Exception as e:
             raise DataSourceError(f"Failed to stream from MinIO: {str(e)}")
 
-    def _stream_from_gcs(
+    async def _stream_from_gcs(
         self,
         path: str,
         batch_size: int = 100,
         text_column: Optional[str] = None,
         metadata_columns: Optional[List[str]] = None,
         **kwargs
-    ) -> Iterator[Dict[str, Any]]:
+    ) -> AsyncIterator[Dict[str, Any]]:
         """Stream data from Google Cloud Storage."""
         try:
             bucket_name = path.split('/')[2]
@@ -945,7 +909,7 @@ class DataSource:
                 credentials = kwargs.get('gcp_credentials') or self.config.get('gcs_credentials')
                 if not project and not credentials:
                     raise ValueError("GCS project or credentials are required")
-                self._init_cloud_clients(**kwargs)
+                await self._init_cloud_clients(**kwargs)
                 gcs_client = self.gcs_client
                 if gcs_client is None:
                     raise DataSourceError("Failed to initialize GCS client")
@@ -963,7 +927,7 @@ class DataSource:
             batch_docs, batch_metas = [], []
             for blob in blobs:
                 try:
-                    content = blob.download_as_bytes()
+                    content = await blob.download_as_bytes()
                     if blob.name.endswith('.txt'):
                         content = content.decode('utf-8')
                         batch_docs.append(content)
@@ -989,14 +953,14 @@ class DataSource:
         except Exception as e:
             raise DataSourceError(f"Failed to stream from GCS: {str(e)}")
 
-    def _stream_from_azure(
+    async def _stream_from_azure(
         self,
         path: str,
         batch_size: int = 100,
         text_column: Optional[str] = None,
         metadata_columns: Optional[List[str]] = None,
         **kwargs
-    ) -> Iterator[Dict[str, Any]]:
+    ) -> AsyncIterator[Dict[str, Any]]:
         """Stream data from Azure Blob Storage."""
         try:
             container_name = path.split('/')[2]
@@ -1007,7 +971,7 @@ class DataSource:
                 conn_str = kwargs.get('azure_connection_string') or self.config.get('azure_connection_string')
                 if not conn_str:
                     raise ValueError("Azure connection string is required")
-                self._init_cloud_clients(**kwargs)
+                await self._init_cloud_clients(**kwargs)
                 azure_client = self.azure_client
                 if azure_client is None:
                     raise DataSourceError("Failed to initialize Azure client")
@@ -1026,7 +990,7 @@ class DataSource:
             for blob in blobs:
                 try:
                     blob_client = container_client.get_blob_client(blob.name)
-                    content = blob_client.download_blob().readall()
+                    content = await blob_client.download_blob().readall()
                     if blob.name.endswith('.txt'):
                         content = content.decode('utf-8')
                         batch_docs.append(content)
@@ -1052,11 +1016,11 @@ class DataSource:
         except Exception as e:
             raise DataSourceError(f"Failed to stream from Azure: {str(e)}")
 
-    def _stream_file(
+    async def _stream_file(
         self,
         file_path: Union[str, Path],
         batch_size: int
-    ) -> Generator[Dict[str, Any], None, None]:
+    ) -> AsyncIterator[Dict[str, Any]]:
         """Stream data from file in batches.
         
         Args:
@@ -1074,8 +1038,8 @@ class DataSource:
         batch_metadatas = []
         batch_ids = []
         
-        with open(file_path, 'r') as f:
-            for i, line in enumerate(f):
+        async with aiofiles.open(file_path, 'r') as f:
+            async for i, line in enumerate(f):
                 line = line.strip()
                 if not line:
                     continue
@@ -1101,13 +1065,13 @@ class DataSource:
                 "ids": batch_ids
             }
             
-    def _stream_list(
+    async def _stream_list(
         self,
         data: List[Dict[str, Any]],
         text_column: Optional[str] = None,
         metadata_columns: Optional[List[str]] = None,
         batch_size: int = 100
-    ) -> Iterator[Dict[str, Any]]:
+    ) -> AsyncIterator[Dict[str, Any]]:
         """Stream data from a list of dictionaries.
         
         Args:
@@ -1132,13 +1096,13 @@ class DataSource:
                     metadata.append(meta)
             yield {"documents": texts, "metadatas": metadata if metadata else None}
             
-    def _stream_dataframe(
+    async def _stream_dataframe(
         self,
         df: pd.DataFrame,
         text_column: Optional[str],
         metadata_columns: Optional[List[str]],
         batch_size: int
-    ) -> Generator[Dict[str, Any], None, None]:
+    ) -> AsyncIterator[Dict[str, Any]]:
         """Stream data from DataFrame in batches.
         
         Args:
@@ -1174,11 +1138,11 @@ class DataSource:
                 "ids": [f"doc_{j}" for j in range(i, i + len(documents))]
             }
             
-    def _stream_binary(
+    async def _stream_binary(
         self,
         data: Union[bytes, np.ndarray, torch.Tensor],
         batch_size: int
-    ) -> Generator[Dict[str, Any], None, None]:
+    ) -> AsyncIterator[Dict[str, Any]]:
         """Stream data from binary format in batches."""
         try:
             if isinstance(data, bytes):
@@ -1232,45 +1196,39 @@ class DataSource:
         except Exception as e:
             raise DataSourceError(f"Failed to stream binary data: {str(e)}")
 
-    def _stream_from_url(
+    async def _stream_from_url(
         self,
         url: str,
         batch_size: int,
         text_column: Optional[str] = None,
         metadata_columns: Optional[List[str]] = None,
         **kwargs
-    ) -> Iterator[Dict[str, Any]]:
+    ) -> AsyncIterator[Dict[str, Any]]:
         """Stream data from a URL."""
-        if url.startswith("s3://"):
-            return self._stream_from_s3(url, batch_size, text_column, metadata_columns, **kwargs)
-        elif url.startswith("gs://"):
-            return self._stream_from_gcs(url, batch_size, text_column, metadata_columns, **kwargs)
-        elif url.startswith("azure://"):
-            return self._stream_from_azure(url, batch_size, text_column, metadata_columns, **kwargs)
-        elif url.startswith("minio://"):
-            return self._stream_from_minio(url, batch_size, text_column, metadata_columns, **kwargs)
-        else:
-            response = requests.get(url)
-            response.raise_for_status()
-            # Try to determine content type
-            content_type = response.headers.get("content-type", "").lower()
-            if "text" in content_type:
-                return self._stream_text_content(response.text, batch_size, text_column, metadata_columns)
-            elif "json" in content_type:
-                return self._stream_json_content(response.json(), batch_size, text_column, metadata_columns)
-            elif "csv" in content_type:
-                return self._stream_csv_content(response.text, batch_size, text_column, metadata_columns)
-            else:
-                return self._stream_binary(response.content, batch_size)
+        try:
+            async with self._session.get(url) as response:
+                if response.status != 200:
+                    raise DataSourceError(f"Failed to fetch URL: {response.status}")
+                
+                content_type = response.headers.get('content-type', '')
+                if 'text' in content_type:
+                    content = await response.text()
+                    async for batch in self._stream_text_content(content, batch_size, text_column, metadata_columns):
+                        yield batch
+                else:
+                    content = await response.read()
+                    async for batch in self._stream_binary(content, batch_size):
+                        yield batch
+        except Exception as e:
+            raise DataSourceError(f"Failed to stream from URL: {str(e)}")
 
     @staticmethod
-    def _stream_text_content(
-        self,
+    async def _stream_text_content(
         content: str,
         batch_size: int,
         text_column: Optional[str] = None,
         metadata_columns: Optional[List[str]] = None
-    ) -> Iterator[Dict[str, Any]]:
+    ) -> AsyncIterator[Dict[str, Any]]:
         """Stream data from text content."""
         metadata = {'type': 'text'}
         if metadata_columns:
@@ -1284,13 +1242,12 @@ class DataSource:
             }
 
     @staticmethod
-    def _stream_json_content(
-        self,
+    async def _stream_json_content(
         content: Dict[str, Any],
         batch_size: int,
         text_column: Optional[str] = None,
         metadata_columns: Optional[List[str]] = None
-    ) -> Iterator[Dict[str, Any]]:
+    ) -> AsyncIterator[Dict[str, Any]]:
         """Stream data from JSON content."""
         if isinstance(content, list):
             for i in range(0, len(content), batch_size):
@@ -1315,13 +1272,12 @@ class DataSource:
             }
 
     @staticmethod
-    def _stream_csv_content(
-        self,
+    async def _stream_csv_content(
         content: str,
         batch_size: int,
         text_column: Optional[str] = None,
         metadata_columns: Optional[List[str]] = None
-    ) -> Iterator[Dict[str, Any]]:
+    ) -> AsyncIterator[Dict[str, Any]]:
         """Stream data from CSV content."""
         df = pd.read_csv(StringIO(content))
         for i in range(0, len(df), batch_size):
@@ -1335,11 +1291,10 @@ class DataSource:
             }
 
     @staticmethod
-    def _stream_binary_content(
-        self,
+    async def _stream_binary_content(
         content: bytes,
         batch_size: int
-    ) -> Iterator[Dict[str, Any]]:
+    ) -> AsyncIterator[Dict[str, Any]]:
         """Stream data from binary content."""
         yield {
             "documents": [str(content)],

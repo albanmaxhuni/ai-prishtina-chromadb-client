@@ -64,4 +64,20 @@ class QueryError(AIPrishtinaError):
 
 class StorageError(AIPrishtinaError):
     """Raised when there is a storage error."""
+    pass
+
+class VectorizationError(AIPrishtinaError):
+    """Exception raised for vectorization errors."""
+    pass
+
+class FeatureExtractionError(AIPrishtinaError):
+    """Exception raised for feature extraction errors."""
+    pass
+
+class MetricsError(AIPrishtinaError):
+    """Exception raised for metrics errors."""
+    pass
+
+class LoggingError(AIPrishtinaError):
+    """Exception raised for logging errors."""
     pass 

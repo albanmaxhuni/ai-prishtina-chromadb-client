@@ -29,9 +29,9 @@ class ChromaFeatures:
         self.settings = settings or Settings()
         if persist_directory:
             self.settings.persist_directory = persist_directory
-        self.client = chromadb.Client(self.settings)
+        self.client = chromadb.AsyncClient(self.settings)
     
-    def create_collection_with_metadata(
+    async def create_collection_with_metadata(
         self,
         name: str,
         metadata: Dict[str, Any],
@@ -56,7 +56,7 @@ class ChromaFeatures:
             else:
                 ef = None
             
-            return self.client.create_collection(
+            return await self.client.create_collection(
                 name=name,
                 metadata=metadata,
                 embedding_function=ef
@@ -64,7 +64,7 @@ class ChromaFeatures:
         except Exception as e:
             raise DatabaseError(f"Failed to create collection: {str(e)}")
     
-    def get_collection_stats(self, collection_name: str) -> Dict[str, Any]:
+    async def get_collection_stats(self, collection_name: str) -> Dict[str, Any]:
         """
         Get detailed statistics about a collection.
         
@@ -75,12 +75,12 @@ class ChromaFeatures:
             Dictionary containing collection statistics
         """
         try:
-            collection = self.client.get_collection(collection_name)
-            count = collection.count()
+            collection = await self.client.get_collection(collection_name)
+            count = await collection.count()
             
             # Get metadata distribution
             metadata_dist = {}
-            results = collection.get()
+            results = await collection.get()
             if results and results['metadatas']:
                 for metadata in results['metadatas']:
                     for key, value in metadata.items():
@@ -98,7 +98,7 @@ class ChromaFeatures:
         except Exception as e:
             raise DatabaseError(f"Failed to get collection stats: {str(e)}")
     
-    def optimize_collection(
+    async def optimize_collection(
         self,
         collection_name: str,
         optimization_params: Optional[Dict[str, Any]] = None
@@ -111,7 +111,7 @@ class ChromaFeatures:
             optimization_params: Parameters for optimization
         """
         try:
-            collection = self.client.get_collection(collection_name)
+            collection = await self.client.get_collection(collection_name)
             
             # Default optimization parameters
             params = {
@@ -124,7 +124,7 @@ class ChromaFeatures:
                 params.update(optimization_params)
             
             # Apply optimization
-            collection.update_hnsw_params(
+            await collection.update_hnsw_params(
                 ef_construction=params["hnsw_ef_construction"],
                 m=params["hnsw_m"],
                 ef_search=params["hnsw_ef_search"]
@@ -132,7 +132,7 @@ class ChromaFeatures:
         except Exception as e:
             raise DatabaseError(f"Failed to optimize collection: {str(e)}")
     
-    def backup_collection(
+    async def backup_collection(
         self,
         collection_name: str,
         backup_path: str
@@ -145,10 +145,10 @@ class ChromaFeatures:
             backup_path: Path to store the backup
         """
         try:
-            collection = self.client.get_collection(collection_name)
+            collection = await self.client.get_collection(collection_name)
             
             # Get all data
-            results = collection.get()
+            results = await collection.get()
             
             # Save to backup file
             import json
@@ -162,7 +162,7 @@ class ChromaFeatures:
         except Exception as e:
             raise DatabaseError(f"Failed to backup collection: {str(e)}")
     
-    def restore_collection(
+    async def restore_collection(
         self,
         backup_path: str,
         collection_name: str
@@ -182,13 +182,13 @@ class ChromaFeatures:
                 backup_data = json.load(f)
             
             # Create new collection
-            collection = self.create_collection_with_metadata(
+            collection = await self.create_collection_with_metadata(
                 name=collection_name,
                 metadata=backup_data.get('metadatas', [{}])[0]
             )
             
             # Restore data
-            collection.add(
+            await collection.add(
                 documents=backup_data['documents'],
                 metadatas=backup_data['metadatas'],
                 ids=backup_data['ids']
@@ -196,7 +196,7 @@ class ChromaFeatures:
         except Exception as e:
             raise DatabaseError(f"Failed to restore collection: {str(e)}")
     
-    def merge_collections(
+    async def merge_collections(
         self,
         source_collection: str,
         target_collection: str,
@@ -211,15 +211,15 @@ class ChromaFeatures:
             merge_strategy: Strategy for merging ("append" or "update")
         """
         try:
-            source = self.client.get_collection(source_collection)
-            target = self.client.get_collection(target_collection)
+            source = await self.client.get_collection(source_collection)
+            target = await self.client.get_collection(target_collection)
             
             # Get source data
-            source_data = source.get()
+            source_data = await source.get()
             
             if merge_strategy == "append":
                 # Simple append
-                target.add(
+                await target.add(
                     documents=source_data['documents'],
                     metadatas=source_data['metadatas'],
                     ids=source_data['ids']
@@ -231,7 +231,7 @@ class ChromaFeatures:
                     source_data['metadatas'],
                     source_data['ids']
                 ):
-                    target.update(
+                    await target.update(
                         ids=[doc_id],
                         documents=[doc],
                         metadatas=[meta]
@@ -241,7 +241,7 @@ class ChromaFeatures:
         except Exception as e:
             raise DatabaseError(f"Failed to merge collections: {str(e)}")
     
-    def get_similarity_matrix(
+    async def get_similarity_matrix(
         self,
         collection_name: str,
         query_ids: List[str],
@@ -259,17 +259,17 @@ class ChromaFeatures:
             Dictionary containing similarity scores
         """
         try:
-            collection = self.client.get_collection(collection_name)
+            collection = await self.client.get_collection(collection_name)
             results = {}
             
             for query_id in query_ids:
                 # Get document
-                doc = collection.get(ids=[query_id])
+                doc = await collection.get(ids=[query_id])
                 if not doc['documents']:
                     continue
                 
                 # Find similar documents
-                similar = collection.query(
+                similar = await collection.query(
                     query_texts=doc['documents'],
                     n_results=n_results,
                     where={"$ne": {"id": query_id}}

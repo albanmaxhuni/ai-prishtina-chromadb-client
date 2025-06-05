@@ -29,7 +29,7 @@ class FeatureExtractionClient(BaseAPIClient):
         """
         super().__init__(base_url, api_key, timeout, max_retries, headers)
     
-    def extract_features(
+    async def extract_features(
         self,
         data: Union[str, Dict[str, Any]],
         feature_type: str = "text",
@@ -50,9 +50,9 @@ class FeatureExtractionClient(BaseAPIClient):
             "data": data,
             "config": config or {}
         }
-        return self.post(endpoint, json=payload)
+        return await self.post(endpoint, json=payload)
     
-    def batch_extract_features(
+    async def batch_extract_features(
         self,
         data_list: List[Union[str, Dict[str, Any]]],
         feature_type: str = "text",
@@ -73,9 +73,9 @@ class FeatureExtractionClient(BaseAPIClient):
             "data_list": data_list,
             "config": config or {}
         }
-        return self.post(endpoint, json=payload)
+        return await self.post(endpoint, json=payload)
     
-    def process_features(
+    async def process_features(
         self,
         features: Dict[str, Any],
         processor_type: str = "default",
@@ -96,9 +96,9 @@ class FeatureExtractionClient(BaseAPIClient):
             "features": features,
             "config": config or {}
         }
-        return self.post(endpoint, json=payload)
+        return await self.post(endpoint, json=payload)
     
-    def add_to_collection(
+    async def add_to_collection(
         self,
         features: Dict[str, Any],
         collection_name: str,
@@ -122,9 +122,9 @@ class FeatureExtractionClient(BaseAPIClient):
             "id": id,
             "metadata": metadata or {}
         }
-        return self.post(endpoint, json=payload)
+        return await self.post(endpoint, json=payload)
     
-    def query_collection(
+    async def query_collection(
         self,
         collection_name: str,
         query_features: Dict[str, Any],
@@ -151,9 +151,9 @@ class FeatureExtractionClient(BaseAPIClient):
             "where": where,
             "where_document": where_document
         }
-        return self.post(endpoint, json=payload)
+        return await self.post(endpoint, json=payload)
     
-    def get_collection_stats(self, collection_name: str) -> Dict[str, Any]:
+    async def get_collection_stats(self, collection_name: str) -> Dict[str, Any]:
         """Get collection statistics.
         
         Args:
@@ -163,9 +163,9 @@ class FeatureExtractionClient(BaseAPIClient):
             Collection statistics
         """
         endpoint = f"collections/{collection_name}/stats"
-        return self.get(endpoint)
+        return await self.get(endpoint)
     
-    def delete_from_collection(
+    async def delete_from_collection(
         self,
         collection_name: str,
         ids: Optional[List[str]] = None,
@@ -189,4 +189,4 @@ class FeatureExtractionClient(BaseAPIClient):
             "where": where,
             "where_document": where_document
         }
-        return self.post(endpoint, json=payload) 
+        return await self.post(endpoint, json=payload) 

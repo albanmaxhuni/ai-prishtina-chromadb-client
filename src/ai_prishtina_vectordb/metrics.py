@@ -4,7 +4,7 @@ Metrics and monitoring functionality for AIPrishtina VectorDB.
 
 import time
 from typing import Dict, Any, Optional
-from contextlib import contextmanager
+from contextlib import asynccontextmanager
 from .logger import AIPrishtinaLogger
 
 class MetricsCollector:
@@ -30,7 +30,7 @@ class MetricsCollector:
             }
         }
         
-    def record_search(
+    async def record_search(
         self,
         query: str,
         n_results: int,
@@ -53,9 +53,9 @@ class MetricsCollector:
             (current_avg * (current_count - 1) + response_time) / current_count
         )
         
-        self.logger.debug(f"Recorded search metrics: {query}")
+        await self.logger.debug(f"Recorded search metrics: {query}")
         
-    def record_embedding(
+    async def record_embedding(
         self,
         n_documents: int,
         embedding_time: float
@@ -76,7 +76,7 @@ class MetricsCollector:
             (current_avg * (current_count - n_documents) + embedding_time) / current_count
         )
         
-        self.logger.debug(f"Recorded embedding metrics: {n_documents} documents")
+        await self.logger.debug(f"Recorded embedding metrics: {n_documents} documents")
         
     def get_metrics(self) -> Dict[str, Any]:
         """Get current metrics.
@@ -86,7 +86,7 @@ class MetricsCollector:
         """
         return self.metrics
         
-    def reset(self) -> None:
+    async def reset(self) -> None:
         """Reset all metrics to initial values."""
         self.metrics = {
             "search_metrics": {
@@ -100,7 +100,7 @@ class MetricsCollector:
                 "avg_embedding_time": 0.0
             }
         }
-        self.logger.debug("Reset all metrics")
+        await self.logger.debug("Reset all metrics")
 
 class PerformanceMonitor:
     """Monitors performance of operations in AIPrishtina VectorDB."""
@@ -115,8 +115,8 @@ class PerformanceMonitor:
         self.metrics: Dict[str, Dict[str, Any]] = {}
         self.thresholds: Dict[str, float] = {}
         
-    @contextmanager
-    def measure(self, operation: str):
+    @asynccontextmanager
+    async def measure(self, operation: str):
         """Measure execution time of an operation.
         
         Args:
@@ -128,9 +128,9 @@ class PerformanceMonitor:
         finally:
             end_time = time.time()
             duration = end_time - start_time
-            self._record_operation(operation, duration)
+            await self._record_operation(operation, duration)
             
-    def _record_operation(self, operation: str, duration: float) -> None:
+    async def _record_operation(self, operation: str, duration: float) -> None:
         """Record operation metrics.
         
         Args:
@@ -153,7 +153,7 @@ class PerformanceMonitor:
         metrics["min_time"] = min(metrics["min_time"], duration)
         metrics["max_time"] = max(metrics["max_time"], duration)
         
-        self.logger.debug(f"Recorded operation metrics: {operation}")
+        await self.logger.debug(f"Recorded operation metrics: {operation}")
         
     def set_threshold(self, operation: str, threshold: float) -> None:
         """Set performance threshold for an operation.
@@ -163,7 +163,7 @@ class PerformanceMonitor:
             threshold: Threshold in seconds
         """
         self.thresholds[operation] = threshold
-        self.logger.debug(f"Set threshold for {operation}: {threshold}s")
+        asyncio.create_task(self.logger.debug(f"Set threshold for {operation}: {threshold}s"))
         
     def is_threshold_exceeded(self, operation: str) -> bool:
         """Check if operation exceeds its threshold.

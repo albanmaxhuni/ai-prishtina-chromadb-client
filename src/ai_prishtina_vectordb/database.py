@@ -23,6 +23,8 @@ from .logger import AIPrishtinaLogger
 from datetime import datetime
 import json
 import tempfile
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 class Database:
     """
@@ -46,6 +48,7 @@ class Database:
         self.logger = AIPrishtinaLogger()
         self.config = config or {}
         self.collection_name = collection_name
+        self._executor = ThreadPoolExecutor(max_workers=4)
         
         # Initialize ChromaDB client with minimal settings
         try:
@@ -70,12 +73,12 @@ class Database:
                     "index_type": "default"
                 }
             )
-            self.logger.info(f"Initialized database with collection: {collection_name}")
+            asyncio.create_task(self.logger.info(f"Initialized database with collection: {collection_name}"))
         except Exception as e:
-            self.logger.error(f"Failed to initialize database: {str(e)}")
+            asyncio.create_task(self.logger.error(f"Failed to initialize database: {str(e)}"))
             raise DatabaseError(f"Failed to initialize database: {str(e)}")
 
-    def add_from_source(
+    async def add_from_source(
         self,
         source: Union[str, List[Dict[str, Any]]],
         source_type: str = "text",
@@ -94,29 +97,33 @@ class Database:
             **kwargs: Additional parameters for data loading
         """
         try:
-            data_source = DataSource(source_type=source_type, **kwargs)
-            data = data_source.load_data(
-                source=source,
-                text_column=text_column,
-                metadata_columns=metadata_columns,
-                **kwargs
-            )
-            
-            # Validate data
-            validate_documents(data['documents'])
-            for metadata in data['metadatas']:
-                validate_metadata(metadata)
-            
-            self.collection.add(
-                documents=data['documents'],
-                metadatas=data['metadatas'],
-                ids=data['ids']
-            )
-            self.logger.info(f"Added {len(data['documents'])} documents to collection")
+            async with DataSource(source_type=source_type, **kwargs) as data_source:
+                data = await data_source.load_data(
+                    source=source,
+                    text_column=text_column,
+                    metadata_columns=metadata_columns,
+                    **kwargs
+                )
+                
+                # Validate data
+                validate_documents(data['documents'])
+                for metadata in data['metadatas']:
+                    validate_metadata(metadata)
+                
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(
+                    self._executor,
+                    lambda: self.collection.add(
+                        documents=data['documents'],
+                        metadatas=data['metadatas'],
+                        ids=data['ids']
+                    )
+                )
+                await self.logger.info(f"Added {len(data['documents'])} documents to collection")
         except Exception as e:
             raise DatabaseError(f"Failed to add data from source: {str(e)}")
 
-    def add(
+    async def add(
         self,
         embeddings: Optional[np.ndarray] = None,
         documents: Optional[List[str]] = None,
@@ -153,19 +160,27 @@ class Database:
 
             if embeddings is None and documents is not None:
                 # Generate embeddings from documents
-                embeddings = self.collection._embedding_function(documents)
+                loop = asyncio.get_event_loop()
+                embeddings = await loop.run_in_executor(
+                    self._executor,
+                    lambda: self.collection._embedding_function(documents)
+                )
 
-            self.collection.add(
-                embeddings=embeddings.tolist() if isinstance(embeddings, np.ndarray) else embeddings,
-                documents=documents,
-                metadatas=metadatas,
-                ids=ids
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                self._executor,
+                lambda: self.collection.add(
+                    embeddings=embeddings.tolist() if isinstance(embeddings, np.ndarray) else embeddings,
+                    documents=documents,
+                    metadatas=metadatas,
+                    ids=ids
+                )
             )
-            self.logger.info(f"Added {len(documents) if documents is not None else len(embeddings)} vectors to collection")
+            await self.logger.info(f"Added {len(documents) if documents is not None else len(embeddings)} vectors to collection")
         except Exception as e:
             raise DatabaseError(f"Failed to add vectors: {str(e)}")
 
-    def query(
+    async def query(
         self,
         query_texts: Optional[List[str]] = None,
         query_embeddings: Optional[np.ndarray] = None,
@@ -187,35 +202,36 @@ class Database:
             Dict containing query results
         """
         try:
-            # Validate query parameters
-            validate_query_params(
-                query_texts=query_texts,
-                query_embeddings=query_embeddings,
-                n_results=n_results,
-                where=where
+            validate_query_params(n_results, where)
+            
+            if query_texts is None and query_embeddings is None:
+                raise ValidationError("Either query_texts or query_embeddings must be provided")
+            
+            if query_embeddings is None and query_texts is not None:
+                # Generate embeddings from query texts
+                loop = asyncio.get_event_loop()
+                query_embeddings = await loop.run_in_executor(
+                    self._executor,
+                    lambda: self.collection._embedding_function(query_texts)
+                )
+            
+            loop = asyncio.get_event_loop()
+            results = await loop.run_in_executor(
+                self._executor,
+                lambda: self.collection.query(
+                    query_embeddings=query_embeddings.tolist() if isinstance(query_embeddings, np.ndarray) else query_embeddings,
+                    n_results=n_results,
+                    where=where,
+                    **kwargs
+                )
             )
-
-            if query_texts is not None:
-                results = self.collection.query(
-                    query_texts=query_texts,
-                    n_results=n_results,
-                    where=where,
-                    **kwargs
-                )
-            else:
-                results = self.collection.query(
-                    query_embeddings=query_embeddings.tolist(),
-                    n_results=n_results,
-                    where=where,
-                    **kwargs
-                )
-                
-            self.logger.info(f"Queried {len(query_texts) if query_texts else len(query_embeddings)} vectors")
+            
+            await self.logger.info(f"Query returned {len(results['ids'][0])} results")
             return results
         except Exception as e:
             raise DatabaseError(f"Failed to query database: {str(e)}")
 
-    def delete(
+    async def delete(
         self,
         ids: Optional[List[str]] = None,
         where: Optional[Dict[str, Any]] = None
@@ -225,21 +241,25 @@ class Database:
         
         Args:
             ids: Optional list of IDs to delete
-            where: Optional filter conditions for deletion
+            where: Optional filter conditions
         """
         try:
-            if where is not None:
-                validate_metadata(where)
+            if ids is not None:
+                validate_ids(ids)
             
-            self.collection.delete(
-                ids=ids,
-                where=where
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                self._executor,
+                lambda: self.collection.delete(
+                    ids=ids,
+                    where=where
+                )
             )
-            self.logger.info("Deleted vectors from collection")
+            await self.logger.info(f"Deleted vectors from collection")
         except Exception as e:
             raise DatabaseError(f"Failed to delete vectors: {str(e)}")
 
-    def get(
+    async def get(
         self,
         ids: Optional[List[str]] = None,
         where: Optional[Dict[str, Any]] = None,
@@ -251,26 +271,31 @@ class Database:
         Args:
             ids: Optional list of IDs to get
             where: Optional filter conditions
-            **kwargs: Additional get parameters
+            **kwargs: Additional parameters
             
         Returns:
-            Dict containing the requested vectors
+            Dict containing retrieved vectors
         """
         try:
-            if where is not None:
-                validate_metadata(where)
+            if ids is not None:
+                validate_ids(ids)
             
-            results = self.collection.get(
-                ids=ids,
-                where=where,
-                **kwargs
+            loop = asyncio.get_event_loop()
+            results = await loop.run_in_executor(
+                self._executor,
+                lambda: self.collection.get(
+                    ids=ids,
+                    where=where,
+                    **kwargs
+                )
             )
-            self.logger.info("Retrieved vectors from collection")
+            
+            await self.logger.info(f"Retrieved {len(results['ids'])} vectors from collection")
             return results
         except Exception as e:
             raise DatabaseError(f"Failed to get vectors: {str(e)}")
 
-    def update(
+    async def update(
         self,
         ids: List[str],
         embeddings: Optional[np.ndarray] = None,
@@ -287,61 +312,73 @@ class Database:
             metadatas: Optional new metadata
         """
         try:
-            # Validate inputs
-            if documents is not None:
-                validate_documents(documents)
-            if embeddings is not None:
-                validate_embeddings(embeddings)
-            if metadatas is not None:
-                for metadata in metadatas:
-                    validate_metadata(metadata)
+            validate_ids(ids)
             
-            # Convert embeddings to list if provided
-            embeddings_list = None
-            if embeddings is not None:
-                if isinstance(embeddings, np.ndarray):
-                    embeddings_list = embeddings.tolist()
-                else:
-                    embeddings_list = embeddings
+            if embeddings is None and documents is None and metadatas is None:
+                raise ValidationError("At least one of embeddings, documents, or metadatas must be provided")
             
-            self.collection.update(
-                ids=ids,
-                embeddings=embeddings_list,
-                documents=documents,
-                metadatas=metadatas
+            if embeddings is None and documents is not None:
+                # Generate embeddings from documents
+                loop = asyncio.get_event_loop()
+                embeddings = await loop.run_in_executor(
+                    self._executor,
+                    lambda: self.collection._embedding_function(documents)
+                )
+            
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                self._executor,
+                lambda: self.collection.update(
+                    ids=ids,
+                    embeddings=embeddings.tolist() if isinstance(embeddings, np.ndarray) else embeddings,
+                    documents=documents,
+                    metadatas=metadatas
+                )
             )
-            self.logger.info(f"Updated {len(ids)} vectors")
+            await self.logger.info(f"Updated {len(ids)} vectors in collection")
         except Exception as e:
             raise DatabaseError(f"Failed to update vectors: {str(e)}")
 
-    def create_index(
+    async def create_index(
         self,
         index_type: str = "hnsw",
         **kwargs
     ) -> None:
         """
-        Create an index for efficient similarity search.
+        Create an index for the collection.
         
         Args:
-            index_type: Type of index to create ('hnsw', 'flat', etc.)
+            index_type: Type of index to create
             **kwargs: Additional index parameters
         """
         try:
-            # Validate index parameters
-            validate_index_params(index_type, kwargs)
+            validate_index_params(index_type, **kwargs)
             
-            self.collection.create_index(
-                index_type=index_type,
-                **kwargs
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                self._executor,
+                lambda: self.collection.create_index(
+                    index_type=index_type,
+                    **kwargs
+                )
             )
-            self.logger.info("Created collection index")
+            await self.logger.info(f"Created {index_type} index for collection")
         except Exception as e:
             raise DatabaseError(f"Failed to create index: {str(e)}")
 
-    def delete_collection(self) -> None:
+    async def delete_collection(self) -> None:
         """Delete the collection."""
         try:
-            self.client.delete_collection(self.collection.name)
-            self.logger.info(f"Deleted collection: {self.collection.name}")
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                self._executor,
+                lambda: self.client.delete_collection(self.collection_name)
+            )
+            await self.logger.info(f"Deleted collection: {self.collection_name}")
         except Exception as e:
-            raise DatabaseError(f"Failed to delete collection: {str(e)}") 
+            raise DatabaseError(f"Failed to delete collection: {str(e)}")
+
+    def __del__(self):
+        """Cleanup when the object is destroyed."""
+        if hasattr(self, '_executor'):
+            self._executor.shutdown(wait=False) 
