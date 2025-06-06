@@ -13,7 +13,7 @@ from typing import List, Dict, Any
 sys.path.append(str(Path(__file__).parent.parent))
 
 from ai_prishtina_vectordb.config.config_manager import ConfigManager
-from ai_prishtina_vectordb.config.docker_manager import DockerManager
+from ai_prishtina_vectordb.config.docker_manager import DockerManager, ConfigManager
 from ai_prishtina_vectordb.features import FeatureProcessor, TextFeatureExtractor
 from ai_prishtina_vectordb.data_sources import DataSource, TextDataSource
 
